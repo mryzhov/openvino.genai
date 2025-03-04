@@ -1,4 +1,4 @@
-// Copyright (C) 2023-2024 Intel Corporation
+// Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
@@ -8,6 +8,7 @@
 
 #include <openvino/runtime/infer_request.hpp>
 
+#include "visual_language/embedding_model.hpp"
 #include "debug_utils.hpp"
 #include "sequence_group.hpp"
 #include "scheduler.hpp"
@@ -30,23 +31,47 @@ inline std::string get_paged_attention_score_output_for_decoder_layer(size_t dec
 class ModelRunner {
     ov::InferRequest m_request;
     AttentionScoresForEachSubsequence m_last_attention_scores;
-    size_t m_num_decoder_layers, m_block_size;
+    size_t m_block_size;
+    size_t m_num_decoder_layers;
     bool m_collect_attention_scores;
+    bool m_is_use_per_layer_cache_control;
+
+    bool m_is_use_rotation_inputs;
+    std::vector<std::map<size_t, std::vector<size_t>>> m_rotated_block_logical_indices_per_sequence_for_each_layer;
+    std::vector<ov::Tensor> m_cache_rotation_deltas_for_each_layer;
+    ov::Tensor m_cache_rotation_trig_lut;
+
+    // A model to compute token embeddings.
+    // Input shape: [N, conversation length].
+    // Output shape: [1, conversation length, hidden_size].
+    EmbeddingsModel m_embedding;
+
 public:
     /**
      * Constructs the ModelRunner.
      * @param request The ov::InferRequest for the LLM to be inferred in the continuous batching mode.
-     * @param scheduler_config Configuration struct for the scheduler that is to be used with this ModelRunner.
      * @param num_decoder_layers Number of decoder attention layers in the LLM corresponding to the request.
-     * @param collect_attention_scores If true, then after each `forward` call the ModelRunner will collect and make available the per-token attention
-     * scores for each decoder layer, so that these can be used in per-step cache optimizations (such as cache eviction algorithm).
+     * @param collect_attention_scores If true, then after each `forward` call the ModelRunner will collect and make
+     * available the per-token attention scores for each decoder layer, so that these can be used in per-step cache
+     * optimizations (such as cache eviction algorithm).
+     * @param is_use_per_layer_cache_control If true, then the runner will pass cache control input tensors to the model
+     * on a per-attention layer basis.
      */
-    ModelRunner(ov::InferRequest request, size_t block_size, size_t num_decoder_layers = 1, bool collect_attention_scores = false) :
-        m_request(std::move(request)),
-        m_block_size(block_size),
-        m_num_decoder_layers(num_decoder_layers),
-        m_collect_attention_scores(collect_attention_scores) {
+    ModelRunner(ov::InferRequest request,
+                size_t block_size,
+                size_t num_decoder_layers = 1,
+                bool collect_attention_scores = false,
+                bool is_use_per_layer_cache_control = false,
+                bool is_use_rotation_inputs = false)
+        : m_request(std::move(request)),
+          m_block_size(block_size),
+          m_num_decoder_layers(num_decoder_layers),
+          m_collect_attention_scores(collect_attention_scores),
+          m_is_use_per_layer_cache_control(is_use_per_layer_cache_control),
+          m_is_use_rotation_inputs(is_use_rotation_inputs),
+          m_rotated_block_logical_indices_per_sequence_for_each_layer(num_decoder_layers) {
         OPENVINO_ASSERT(m_num_decoder_layers != 0, "num_decoder_layers must be non-zero");
+        _reset_cache_rotation_coefficients();
     }
 
     /**
@@ -56,6 +81,10 @@ public:
         return m_request;
     }
 
+    void set_embedding_model(const EmbeddingsModel& embedder) {
+        m_embedding = embedder;
+    }
+
     /**
      * @return A map of sequence IDs to vectors of ov::Tensor per-token attention scores. Each vector element is associated with its own
      * decoder layer, in order of their execution in the model. Each ov::Tensor has a shape of {N_k}, where N_k is the length of
@@ -63,6 +92,18 @@ public:
      */
     const AttentionScoresForEachSubsequence& get_last_attention_scores() const {
         return m_last_attention_scores;
+    }
+
+    void set_cache_rotation_trig_lut(ov::Tensor&& rotation_trig_lut) {
+        m_cache_rotation_trig_lut = std::move(rotation_trig_lut);
+    }
+
+    void set_cache_rotation_data(std::vector<std::map<size_t, std::vector<size_t>>>&&
+                                     rotated_logical_block_indices_per_sequence_for_each_layer,
+                                 std::vector<ov::Tensor>&& rotation_deltas_for_each_layer) {
+        m_rotated_block_logical_indices_per_sequence_for_each_layer =
+            std::move(rotated_logical_block_indices_per_sequence_for_each_layer);
+        m_cache_rotation_deltas_for_each_layer = std::move(rotation_deltas_for_each_layer);
     }
 
     /**
@@ -77,6 +118,13 @@ public:
         size_t batch_size_in_sequences = 0;
         size_t total_num_tokens = 0, total_num_blocks = 0;
         size_t max_context_len_val = 0;
+        size_t hidden_size = 0;
+        size_t num_generated_ids = 0;
+        OPENVINO_ASSERT(sequence_groups.size() > 0);
+        auto sequence_group_type = sequence_groups[0]->get_sequence_group_type();
+        if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
+            hidden_size = sequence_groups[0]->get_hidden_size();
+        }
 
         // compute aggregated values
         for (size_t i = 0; i < num_sequence_groups; ++i) {
@@ -87,10 +135,14 @@ public:
             total_num_tokens += sequence_group->get_num_scheduled_tokens() * num_sequences;
             total_num_blocks += sequence_group->get_num_blocks() * num_sequences;
             max_context_len_val = std::max(max_context_len_val, sequence_group->get_context_len());
+            for (auto seq: sequence_group->get_running_sequences()) {
+                num_generated_ids += seq->get_generated_len();
+            }
         }
 
         ov::Tensor
             input_ids(ov::element::i64, {total_num_tokens}),
+            inputs_embeds(ov::element::f32, {total_num_tokens, hidden_size}),
             position_ids(ov::element::i64, {total_num_tokens}),
             // PA specific parameters
             past_lens(ov::element::i32, {batch_size_in_sequences}),
@@ -98,13 +150,47 @@ public:
             // block_indices are handled in a special fashion below
             block_indices_begins(ov::element::i32, {batch_size_in_sequences + 1}),
             max_context_len(ov::element::i32, {});
+        
+        ov::Tensor generated_ids_embeds;
+        float *generated_ids_embeds_data = nullptr;
 
         max_context_len.data<int32_t>()[0] = max_context_len_val;
 
         // get raw pointers to copy to
+        float *inputs_embeds_data = nullptr;
+        int64_t *input_ids_data = nullptr;
+        
+        if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
+            OPENVINO_ASSERT(m_embedding.get_request(), "Got sequence group with embeddings, but embeddings model wasn't set.");
+            inputs_embeds_data = inputs_embeds.data<float>();
+
+            ov::Tensor generated_ids = ov::Tensor(ov::element::i64, {1, num_generated_ids});
+            int64_t *generated_ids_data = generated_ids.data<int64_t>();
+            size_t pos = 0;
+            for (size_t i = 0; i < num_sequence_groups; ++i) {
+                size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
+                SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
+                for (auto seq: sequence_group->get_running_sequences()) {
+                    auto generated_ids = seq->get_generated_ids();
+                    for (size_t token_idx = 0; token_idx < generated_ids.size(); token_idx++) {
+                        generated_ids_data[pos] = generated_ids[token_idx];
+                        pos++;
+                    }
+                }
+            }
+            if (pos > 0) {
+                // TODO: Compute embeddings only for last generated token, while previously generated embeddings save in SequenceGroup
+                generated_ids_embeds = m_embedding.infer(generated_ids);
+                generated_ids_embeds_data = generated_ids_embeds.data<float>();
+            }
+
+        } else if (sequence_group_type == SequenceGroupType::TOKENS) {
+            input_ids_data = input_ids.data<int64_t>();
+        }
+
         int64_t
-            * input_ids_data = input_ids.data<int64_t>(),
             * position_ids_data = position_ids.data<int64_t>();
+
         int32_t 
             * past_lens_data = past_lens.data<int32_t>(),
             * subsequence_begins_data = subsequence_begins.data<int32_t>(),
@@ -143,9 +229,17 @@ public:
                 Sequence::CPtr sequence = running_sequences[seq_id];
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
-                    input_ids_data[token_id] = position_id < prompt_len ?
-                        sequence_group->get_prompt_ids()[position_id] :
-                        sequence->get_generated_ids()[position_id - prompt_len];
+                    if (sequence_group_type == SequenceGroupType::TOKENS) {
+                        input_ids_data[token_id] = position_id < prompt_len ?
+                            sequence_group->get_prompt_ids()[position_id] :
+                            sequence->get_generated_ids()[position_id - prompt_len];
+                    } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
+                        auto embeds_pos = position_id < prompt_len ? 0 : hidden_size * (position_id - prompt_len);
+                        const float* src = position_id < prompt_len ? sequence_group->get_input_embeds()[position_id].data() :  generated_ids_embeds_data + embeds_pos;
+                        std::copy_n(src, hidden_size, inputs_embeds_data + token_id * hidden_size);
+                    } else {
+                        OPENVINO_THROW("Unknown model inputs type.");
+                    }
 
                     position_ids_data[token_id] = position_id;
 
@@ -173,7 +267,13 @@ public:
                 block_indices_begins_data[1] = block_indices_begins_data[0] + num_blocks;
 
                 // apply strides to shift to a next sequence
-                input_ids_data += num_scheduled_tokens;
+                if (sequence_group_type == SequenceGroupType::TOKENS) {
+                    input_ids_data += num_scheduled_tokens;
+                } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
+                    inputs_embeds_data += num_scheduled_tokens * hidden_size;
+                    generated_ids_embeds_data += sequence->get_generated_len() * hidden_size;
+                }
+
                 position_ids_data += num_scheduled_tokens;
                 past_lens_data += 1;
                 subsequence_begins_data += 1;
@@ -182,18 +282,28 @@ public:
             sequence_group->set_output_seq_len(matmul_gathering_is_available ? output_seq_len : num_scheduled_tokens);
         }
 
+        if (sequence_group_type == SequenceGroupType::TOKENS) {
+            m_request.set_tensor("input_ids", input_ids);
+        }
+        else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
+            m_request.set_tensor("inputs_embeds", inputs_embeds);
+        }
+
         // typical LLM parameters
-        m_request.set_tensor("input_ids", input_ids);
         m_request.set_tensor("position_ids", position_ids);
 
         // PA specific parameters
         m_request.set_tensor("past_lens", past_lens);
         m_request.set_tensor("subsequence_begins", subsequence_begins);
 
-        _set_block_indices(m_request, sequence_groups, scheduler_output, total_num_blocks);
-
+        _set_block_indices(sequence_groups, scheduler_output, total_num_blocks);
         m_request.set_tensor("block_indices_begins", block_indices_begins);
         m_request.set_tensor("max_context_len", max_context_len);
+
+        if (m_is_use_rotation_inputs) {
+            m_request.set_tensor("rotation_trig_lut", m_cache_rotation_trig_lut);
+            _set_cache_rotation_coefficients(sequence_groups, scheduler_output);
+        }
 
         if (matmul_gathering_is_available) {
             ov::Tensor gather_indices(ov::element::i64, {gather_indices_values.size()});
@@ -221,17 +331,87 @@ public:
             _collect_attention_scores(sequence_groups, scheduler_output);
         }
 
+        _reset_cache_rotation_coefficients();
+
         // return logits
         return m_request.get_tensor("logits");
     }
 
 private:
-    void _set_block_indices(ov::InferRequest& infer_request, const std::vector<SequenceGroup::Ptr> & sequence_groups, const Scheduler::Output& scheduler_output,
-                            size_t total_num_blocks) {
+    void _fill_indices_from_block_tables(
+        const std::vector<std::string>& dst_tensor_names,
+        const std::vector<SequenceGroup::Ptr>& sequence_groups,
+        const Scheduler::Output& scheduler_output,
+        const std::vector<std::map<size_t, std::vector<size_t>>>& seq_id_to_select_logical_idx_maps) {
+        OPENVINO_ASSERT(seq_id_to_select_logical_idx_maps.size() == dst_tensor_names.size() ||
+                        seq_id_to_select_logical_idx_maps.empty());
+        bool is_fill_all = seq_id_to_select_logical_idx_maps.empty();
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
+        std::vector<size_t> filled_blocks_per_layer(dst_tensor_names.size(), 0);
+
+
+        for (size_t layer_idx = 0; layer_idx < dst_tensor_names.size(); layer_idx++) {
+            auto input_tensor = m_request.get_tensor(dst_tensor_names[layer_idx]);
+            auto block_indices_data = input_tensor.data<int32_t>();
+            if (is_fill_all) {
+                for (size_t i = 0; i < num_sequence_groups; ++i) {
+                    size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
+                    SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
+                    std::vector<Sequence::CPtr> running_sequences = sequence_group->get_running_sequences();
+                    size_t num_running_sequences = running_sequences.size();
+
+                    for (size_t i = 0; i < num_running_sequences; ++i) {
+                        Sequence::CPtr sequence = running_sequences[i];
+
+                        size_t num_blocks = sequence_group->get_num_logical_blocks();
+                        const auto& kv_blocks = scheduler_output.m_block_tables.at(sequence->get_id());
+
+
+                        for (size_t block_id = 0; block_id < num_blocks; ++block_id) {
+                            // In case no cache eviction is requested, all per-layer block tables are expected to be
+                            // identical at all times
+                            block_indices_data[block_id] = kv_blocks[layer_idx][block_id]->get_index();
+                        }
+                        block_indices_data += num_blocks;
+                        filled_blocks_per_layer[layer_idx] += num_blocks;
+                    }
+                }
+            } else {
+                    // This branch will fill the block indices in the seq_id order defined by the seq_id_to_select_logical_idx_maps argument
+                    auto seq_id_to_select_logical_idx_map = seq_id_to_select_logical_idx_maps[layer_idx];
+                    for (const auto& kv : seq_id_to_select_logical_idx_map) {
+                        size_t seq_id = kv.first;
+                        auto block_table_it = scheduler_output.m_block_tables.find(seq_id);
+                        OPENVINO_ASSERT(block_table_it != scheduler_output.m_block_tables.end());
+                        const auto& select_logical_idxs = kv.second;
+                        const auto& kv_blocks = block_table_it->second;
+                        size_t block_table_size = kv_blocks[layer_idx].size();
+
+                        for (size_t block_id = 0; block_id < select_logical_idxs.size(); ++block_id) {
+                            size_t logical_block_idx = select_logical_idxs[block_id];
+                            OPENVINO_ASSERT(logical_block_idx < block_table_size);
+
+                            block_indices_data[block_id] = kv_blocks[layer_idx][logical_block_idx]->get_index();
+                        }
+                    block_indices_data += select_logical_idxs.size();
+                    filled_blocks_per_layer[layer_idx] += select_logical_idxs.size();
+                }
+            }
+        }
+        for (size_t layer_idx = 0; layer_idx < dst_tensor_names.size(); layer_idx++) {
+            const auto& target_tensor_name = dst_tensor_names[layer_idx];
+            size_t tensor_size = m_request.get_tensor(target_tensor_name).get_size();
+            size_t last_filled_element_idx = filled_blocks_per_layer[layer_idx];
+            OPENVINO_ASSERT(tensor_size == last_filled_element_idx, "did not fill tensor ", target_tensor_name, " completely, tensor size in elements ", tensor_size, ", last filled idx ", last_filled_element_idx);
+        }
+    }
+
+    void _set_block_indices(const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                            const Scheduler::Output& scheduler_output,
+                            size_t total_num_blocks) {
         std::vector<std::string> tensor_names = {"block_indices"};
 
-        if (m_collect_attention_scores) {
+        if (m_is_use_per_layer_cache_control) {
             tensor_names.resize(m_num_decoder_layers);
             for (size_t i = 0; i < tensor_names.size(); i++) {
                 tensor_names[i] = std::string("block_indices.") + std::to_string(i);
@@ -242,30 +422,41 @@ private:
             m_request.get_tensor(name).set_shape({total_num_blocks});
         }
 
-        size_t block_offset = 0;
-        for (size_t i = 0; i < num_sequence_groups; ++i) {
-            size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
-            SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
-            std::vector<Sequence::CPtr> running_sequences = sequence_group->get_running_sequences();
-            size_t num_running_sequences = running_sequences.size();
+        _fill_indices_from_block_tables(tensor_names, sequence_groups, scheduler_output, {});
+    }
 
-            for (size_t seq_id = 0; seq_id < num_running_sequences; ++seq_id) {
-                Sequence::CPtr sequence = running_sequences[seq_id];
-
-                size_t num_blocks = (sequence_group->get_context_len()  - sequence_group->get_num_evicted_tokens() +  m_block_size - 1) / m_block_size;
-                const auto & kv_blocks = scheduler_output.m_block_tables.at(sequence->get_id());
-
-                for (size_t layer_idx = 0; layer_idx < tensor_names.size(); layer_idx++) {
-                    auto input_tensor = infer_request.get_tensor(tensor_names[layer_idx]);
-                    auto block_indices_data = input_tensor.data<int32_t>() + block_offset;
-                    for (size_t block_id = 0; block_id < num_blocks; ++block_id)
-                        // In case no cache eviction is requested, all per-layer block tables are expected to be identical
-                        // at all times
-                        block_indices_data[block_id] = kv_blocks[layer_idx][block_id]->get_index();
-                }
-
-                block_offset += num_blocks;
+    void _set_cache_rotation_coefficients(const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                                          const Scheduler::Output& scheduler_output) {
+        std::vector<std::string> rotation_indices_tensor_names(m_num_decoder_layers);
+        for (size_t i = 0; i < m_num_decoder_layers; i++) {
+            auto tensor_name = std::string("rotated_block_indices.") + std::to_string(i);
+            rotation_indices_tensor_names[i] = tensor_name;
+            size_t num_indices = 0;
+            for (const auto& entry : m_rotated_block_logical_indices_per_sequence_for_each_layer[i]) {
+                num_indices += entry.second.size();
             }
+            auto rotated_block_indices_tensor = m_request.get_tensor(tensor_name);
+            rotated_block_indices_tensor.set_shape({num_indices});
+        }
+
+        for (size_t i = 0; i < m_num_decoder_layers; i++) {
+            auto tensor_name = std::string("rotation_deltas.") + std::to_string(i);
+            m_request.set_tensor(tensor_name, m_cache_rotation_deltas_for_each_layer[i]);
+        }
+
+
+        // NB: the order of per-sequence index filling in the function below must be the same
+        // as the order of `seq_id`s in which the "rotation_coefficients.N" inputs are filled
+        _fill_indices_from_block_tables(rotation_indices_tensor_names,
+                                        sequence_groups,
+                                        scheduler_output,
+                                        m_rotated_block_logical_indices_per_sequence_for_each_layer);
+    }
+
+    void _reset_cache_rotation_coefficients() {
+        m_cache_rotation_deltas_for_each_layer.clear();
+        for (size_t i = 0; i < m_num_decoder_layers; i++) {
+            m_cache_rotation_deltas_for_each_layer.push_back(ov::Tensor());
         }
     }
 
