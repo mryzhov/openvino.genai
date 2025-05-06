@@ -109,7 +109,7 @@ torch = {  version = "*", source = "pytorch-cpu" }
 optional = true
 
 [tool.poetry.group.dev.dependencies]
-optimum-intel = { git = "https://github.com/huggingface/optimum-intel.git", rev = "303bc50fdeb34b427dc1b04be741bf4f11415b2d", extras = ["nncf"], allow-prereleases = true }
+optimum-intel = { git = "https://github.com/huggingface/optimum-intel.git", branch = "main", extras = ["nncf"], allow-prereleases = true }
 
 [tool.poetry.group.tests]
 optional = true
