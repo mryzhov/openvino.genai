@@ -49,7 +49,7 @@ samples = [
     "timm==1.0.15",  # For exporting InternVL2
     "torchvision==0.22.0",  # For visual language models
     "torch",
-    "transformers>=4.43",  # For Whisper
+    "transformers>=4.43.0,<=4.51.2",  # For Whisper
     "hf_transfer",  # For faster models download, should be used with env var HF_HUB_ENABLE_HF_TRANSFER=1
     "librosa==0.11.0",  # For Whisper
     "pillow==11.2.1"  # Image processing for VLMs
@@ -73,7 +73,7 @@ options = {"ENABLE_PYTHON" = "ON", "BUILD_TOKENIZERS" = "OFF", "ENABLE_SAMPLES" 
 
 [build-system]
 requires = [
-    "py-build-cmake==0.4.3",
+    "py-build-cmake==0.4.2",
     "openvino~=2025.2.0.0.dev",
     "pybind11-stubgen==2.5.3",
     "cmake~=3.23.0; platform_system != 'Darwin' or platform_machine == 'x86_64'",
@@ -104,6 +104,7 @@ priority = "supplemental"
 openvino_tokenizers = { version = "*", source = "openvino-nightly" }
 torchvision = {  version = "*", source = "pytorch-cpu" }
 torch = {  version = "*", source = "pytorch-cpu" }
+whowhatbench = { path = "tools/who_what_benchmark", develop = true }
 
 [tool.poetry.group.dev]
 optional = true
@@ -117,6 +118,7 @@ optional = true
 [tool.poetry.group.tests.dependencies]
 pytest = ">=7.0.0,<=8.3.5"
 pytest-html = ">=3.0.0,<=4.1.1"
+pytest-xdist = ">=3.4.0,<=3.5.0"
 diffusers = ">=0.30.0,<=0.33.1"
 onnx = ">=1.16.0,<=1.17.0"
 hf_transfer = ">=0.1.0,<=0.1.9"
@@ -151,7 +153,7 @@ sacremoses = "==0.1.1"
 # - openai/whisper-base
 librosa = ">=0.10.1,<=0.11.0"
 soundfile = ">=0.12.0,<=0.13.1"
-datasets = ">=3.3.0,<=3.5.1"
+datasets = ">=3.3.0,<=3.5.0"
 rouge = "==1.0.1"
 
 [tool.poetry.group.wwb]
