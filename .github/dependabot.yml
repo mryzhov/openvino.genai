@@ -11,7 +11,7 @@ updates:
       interval: "daily"
       time: "09:00"
       timezone: "Europe/Dublin"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 9
     
   #
   # Enable version updates for npm
@@ -22,7 +22,7 @@ updates:
       interval: "daily"
       time: "09:00"
       timezone: "Europe/Dublin"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     versioning-strategy: increase-if-necessary
     
   #
