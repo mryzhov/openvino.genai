@@ -118,7 +118,7 @@ optional = true
 [tool.poetry.group.tests.dependencies]
 pytest = ">=7.0.0,<=8.3.5"
 pytest-html = ">=3.0.0,<=4.1.1"
-pytest-xdist = ">=3.4.0,<=3.5.0"
+pytest-xdist = ">=3.4.0,<=3.6.1"
 diffusers = ">=0.30.0,<=0.33.1"
 onnx = ">=1.16.0,<=1.17.0"
 hf_transfer = ">=0.1.0,<=0.1.9"
